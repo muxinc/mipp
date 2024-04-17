@@ -1,0 +1,283 @@
+diff --git a/configure b/configure
+index b6616f0..0abca75 100755
+--- a/configure
++++ b/configure
+@@ -1873,6 +1873,7 @@ EXTERNAL_LIBRARY_LIST="
+     openssl
+     pocketsphinx
+     vapoursynth
++    mipp
+ "
+ 
+ HWACCEL_AUTODETECT_LIBRARY_LIST="
+@@ -6796,6 +6797,7 @@ enabled rkmpp             && { require_pkg_config rkmpp rockchip_mpp  rockchip/r
+                              }
+ enabled vapoursynth       && require_pkg_config vapoursynth "vapoursynth-script >= 42" VSScript.h vsscript_init
+ 
++enabled mipp && require libmipp "mipp.h" mipp_init -lmipp
+ 
+ if enabled gcrypt; then
+     GCRYPT_CONFIG="${cross_prefix}libgcrypt-config"
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index b3d3d98..280b07f 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -612,6 +612,7 @@ OBJS-$(CONFIG_SHOWVOLUME_FILTER)             += avf_showvolume.o
+ OBJS-$(CONFIG_SHOWWAVES_FILTER)              += avf_showwaves.o
+ OBJS-$(CONFIG_SHOWWAVESPIC_FILTER)           += avf_showwaves.o
+ OBJS-$(CONFIG_SPECTRUMSYNTH_FILTER)          += vaf_spectrumsynth.o
++OBJS-$(CONFIG_MIPP_FILTER)                   += avf_mipp.o
+ 
+ # multimedia sources
+ OBJS-$(CONFIG_AVSYNCTEST_FILTER)             += src_avsynctest.o
+diff --git a/libavfilter/allfilters.c b/libavfilter/allfilters.c
+index d7db46c..3b85a3b 100644
+--- a/libavfilter/allfilters.c
++++ b/libavfilter/allfilters.c
+@@ -577,6 +577,7 @@ extern const AVFilter ff_avf_showvolume;
+ extern const AVFilter ff_avf_showwaves;
+ extern const AVFilter ff_avf_showwavespic;
+ extern const AVFilter ff_vaf_spectrumsynth;
++extern const AVFilter ff_avf_mipp;
+ 
+ /* multimedia sources */
+ extern const AVFilter ff_avsrc_avsynctest;
+@@ -587,20 +588,19 @@ extern const AVFilter ff_avsrc_movie;
+  * they are formatted to not be found by the grep
+  * as they are manually added again (due to their 'names'
+  * being the same while having different 'types'). */
+-extern  const AVFilter ff_asrc_abuffer;
+-extern  const AVFilter ff_vsrc_buffer;
+-extern  const AVFilter ff_asink_abuffer;
+-extern  const AVFilter ff_vsink_buffer;
++extern const AVFilter ff_asrc_abuffer;
++extern const AVFilter ff_vsrc_buffer;
++extern const AVFilter ff_asink_abuffer;
++extern const AVFilter ff_vsink_buffer;
+ extern const AVFilter ff_af_afifo;
+ extern const AVFilter ff_vf_fifo;
+ 
+ #include "libavfilter/filter_list.c"
+ 
+-
+-const AVFilter *av_filter_iterate(void **opaque)
++const AVFilter* av_filter_iterate(void** opaque)
+ {
+     uintptr_t i = (uintptr_t)*opaque;
+-    const AVFilter *f = filter_list[i];
++    const AVFilter* f = filter_list[i];
+ 
+     if (f)
+         *opaque = (void*)(i + 1);
+@@ -608,10 +608,10 @@ const AVFilter *av_filter_iterate(void **opaque)
+     return f;
+ }
+ 
+-const AVFilter *avfilter_get_by_name(const char *name)
++const AVFilter* avfilter_get_by_name(const char* name)
+ {
+-    const AVFilter *f = NULL;
+-    void *opaque = 0;
++    const AVFilter* f = NULL;
++    void* opaque = 0;
+ 
+     if (!name)
+         return NULL;
+diff --git a/libavfilter/avf_mipp.c b/libavfilter/avf_mipp.c
+new file mode 100644
+index 0000000..2172687
+--- /dev/null
++++ b/libavfilter/avf_mipp.c
+@@ -0,0 +1,192 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/**
++ * @file
++ * mipp video filter
++ */
++
++#include "avfilter.h"
++#include "filters.h"
++#include "framesync.h"
++#include "internal.h"
++#include "libavfilter/internal.h"
++#include "libavutil/avstring.h"
++#include "libavutil/internal.h"
++#include "libavutil/opt.h"
++#include "video.h"
++
++#include <mipp.h>
++
++typedef struct MippContext
++{
++    const AVClass *class;
++    mipp_t mipp;
++    FFFrameSync fs;
++    char *script_url;
++} MippContext;
++
++#define OFFSET(x) offsetof(MippContext, x)
++static const AVOption mipp_options[] = {
++    {"script", "script file to load", OFFSET(script_url), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM | AV_OPT_FLAG_FILTERING_PARAM},
++    {NULL}};
++
++AVFILTER_DEFINE_CLASS(mipp);
++
++static int ff_mipp_receive_video_frame(void *opaque, int width, int height, double pts, uint8_t *data)
++{
++    int err = 0;
++    AVFrame *f = av_frame_alloc();
++    AVFilterContext *ctx = (AVFilterContext *)opaque;
++    f->width = width;
++    f->height = height;
++    f->format = AV_PIX_FMT_RGB32;
++    f->pts = pts * AV_TIME_BASE;
++    err = av_frame_get_buffer(f, 0);
++    if (err < 0)
++        return err;
++
++    for (int y = 0; y < f->height; y++)
++        memcpy(f->data[0] + y * f->linesize[0], data + (y * width * 4), width * 4);
++
++    err = ff_filter_frame(ctx->outputs[0], f);
++    return err;
++}
++
++static void ff_mipp_log(int level, const char *txt)
++{
++    av_log(&mipp_class, level, "%s", txt);
++}
++
++static int ff_mipp_process_frame(FFFrameSync *fs)
++{
++    double pts = 0;
++    int i, err = 0;
++    AVFrame *in = 0;
++    MippContext *m = fs->opaque;
++    AVFilterContext *ctx = fs->parent;
++    for (i = 0; i < ctx->nb_inputs; i++)
++    {
++        // We dont need to "get" the frame because mipp_send_video_frame will make a copy of the frame data
++        if ((err = ff_framesync_get_frame(&m->fs, i, &in, 0)) < 0)
++            return err;
++
++        pts = av_rescale_q(in->pts, fs->time_base, AV_TIME_BASE_Q);
++        mipp_send_video_frame(&m->mipp, in->width, in->height, in->linesize[0], pts / AV_TIME_BASE, in->data[0], i);
++    }
++
++    return 0;
++}
++
++static int ff_filter_config_props(AVFilterLink *outlink)
++{
++    int i, err;
++    FFFrameSyncIn *in;
++    AVFilterContext *ctx = outlink->src;
++    MippContext *m = ctx->priv;
++
++    switch (outlink->type)
++    {
++    case AVMEDIA_TYPE_VIDEO:
++        // For now we will just use the first video input to configure the output
++        outlink->w = ctx->inputs[0]->w;
++        outlink->h = ctx->inputs[0]->h;
++        outlink->sample_aspect_ratio = ctx->inputs[0]->sample_aspect_ratio;
++        outlink->time_base = AV_TIME_BASE_Q;
++        break;
++    }
++
++    outlink->time_base = AV_TIME_BASE_Q;
++    err = ff_framesync_init(&m->fs, ctx, ctx->nb_inputs);
++    if (err < 0)
++        return err;
++
++    in = m->fs.in;
++    for (i = 0; i < ctx->nb_inputs; ++i)
++    {
++        in[i].time_base = ctx->inputs[i]->time_base;
++        in[i].sync = 1;
++        in[i].after = EXT_STOP;
++        in[i].before = EXT_STOP;
++    }
++
++    m->fs.opaque = m;
++    m->fs.on_event = ff_mipp_process_frame;
++    return ff_framesync_configure(&m->fs);
++}
++
++static int ff_mipp_init(AVFilterContext *ctx)
++{
++    int i, err = 0;
++    AVFilterPad pad = {0};
++    struct MippContext *m = ctx->priv;
++
++    ctx->output_pads[0].config_props = ff_filter_config_props;
++    mipp_init(&m->mipp, m->script_url, ctx, ff_mipp_receive_video_frame, ff_mipp_log);
++    for (i = 0; i < m->mipp.video_in_count; ++i)
++    {
++        pad.type = AVMEDIA_TYPE_VIDEO;
++        pad.name = av_asprintf("in%d", i);
++        err = ff_append_inpad_free_name(ctx, &pad);
++        if (err < 0)
++            return err;
++    }
++
++    return 0;
++}
++
++static int ff_mipp_activate(AVFilterContext *ctx)
++{
++    struct MippContext *m = ctx->priv;
++    return ff_framesync_activate(&m->fs);
++}
++
++static void ff_mipp_uninit(AVFilterContext *ctx)
++{
++    struct MippContext *m = ctx->priv;
++    ff_framesync_uninit(&m->fs);
++    mipp_free(&m->mipp);
++}
++
++static const AVFilterPad avfilter_avf_mipp_outputs[] = {
++    {
++        .name = "default",
++        .type = AVMEDIA_TYPE_VIDEO,
++    },
++};
++
++static const enum AVPixelFormat pix_fmts[] = {
++    AV_PIX_FMT_RGB32,
++    AV_PIX_FMT_NONE,
++};
++
++const AVFilter ff_avf_mipp = {
++    .name = "mipp",
++    .description = NULL_IF_CONFIG_SMALL("The do anything filter."),
++
++    .init = ff_mipp_init,
++    .uninit = ff_mipp_uninit,
++    .activate = ff_mipp_activate,
++
++    .priv_class = &mipp_class,
++    .priv_size = sizeof(struct MippContext),
++
++    .flags = AVFILTER_FLAG_DYNAMIC_INPUTS,
++    FILTER_OUTPUTS(avfilter_avf_mipp_outputs),
++    FILTER_PIXFMTS_ARRAY(pix_fmts),
++};
